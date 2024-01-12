@@ -1,0 +1,354 @@
+#!/usr/bin/perl
+# vim: ts=4 : sw=4 : et :
+
+# TODO: Implement possibility to specify regex for variable parsing.
+# TODO: Add man section for .md file creation for script to parse good.
+# TODO: Implement `.md` file sanitizer/checker.
+# TODO: Implement interacting with ROFI.
+# TODO: Implement interacting with GUAKE.
+# TODO: Implement interacting with another terminal menu/fuzzy-finder aside from `fzf`.
+# TODO: Implement choosing to walk through tree in a file (h1->h2->h3->block_quote) and parsing file in this way.
+
+# -- PERLDOC {{{
+=pod
+
+=encoding UTF-8
+
+=head1 NAME
+
+CommandCopy - script to parse .md file and copy code snippet chosen by user to Clipboard.
+
+=head1 SYNOPSIS
+
+CommandCopy [--help|-h] [--help-man] [--verbose|-v] [--vars TYPE|-V TYPE] [--menu MENU|-m MENU] [--menu-args "ARGS"] < [--file FILE|-f FILE] | FILE >
+
+perldoc <this script> - more info (man-page style)
+
+=head1 DESCRIPTION
+
+This script parses specified markdown file in search of commands
+and prompts for input when commmand parsed contains variables.
+Then depending on a type of variable treatment either substitutes them
+in snippet or assigns them as shell variables in before the commmand.
+Then the whole command is passed to Xclip for mouseless usage.
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<--help -h>
+
+    Print this help and exit.
+
+=item B<--man-help>
+
+    Print help in man-pages/perldoc format, paged.
+
+=item B<--verbose -v>
+
+    Make script output verbose or quiet;
+
+    On default: quiet / no additional output.
+
+=item B<--file -f> I<FILE>
+
+    ( Optional ) Specify Markdown (CommonMark spec) file to parse commands from. If not specified through this switch, FILE name should be specified as first positional argument.
+
+=item B<--vars -V> I<TYPE>
+
+    Type of variable assignment in commands which will be chosen.
+    Available options are: [ "substitution" | "assignment" ].
+
+    "substitution" substitutes the $variable to "value" specified during script execution like:
+        Before : `(code_snippet_p1)$variable(code_snippet_p2)`;
+        After  : `(code_snippet_p1)value(code_snippet_p2)`;
+
+    "assignment" prepends code snippet with shell variables assignment like:
+        Before : `(code_snippet_p1)$variable(code_snippet_p2)`;
+        After  : `variable="value"; (code_snippet_p1)$variable(code_snippet_p2)`;
+
+    On default: "substitution".
+    NOTE: If bad option is specified, no warning will be printed and script will fallback to "substitution".
+
+=item B<--menu -m> I<MENU>
+
+    Choose menu by which command will be chosen;
+
+    On default: "fzf"
+
+=item B<--menu-args> I<ARGS>
+
+    Command-line arguments specified in one string for menu specified by `--menu` option;
+
+    On default: ""
+
+=item I<FILE>
+
+    Specify FILE name to parse commands from
+
+=back
+
+=head1 EXAMPLES
+
+Not yet implemented.
+
+=head1 MODULES
+
+Modules used:
+
+    - CommonMark
+    - Clipboard
+    - Getopt::Long
+    - Pod::Usage
+    - Switch
+
+=head1 AUTHOR
+
+Adam Twardosz < a.twardosz98@gmail.com >
+
+=head1 COPYRIGHT AND LICENSE
+
+Copyright 2022 Adam Twardosz
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the “Software”), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+=cut
+# -- }}}
+
+use strict;
+use warnings;
+use v5.10;
+
+use CommonMark qw(:node :event);
+use Clipboard;
+use Getopt::Long qw(GetOptions Configure);
+use Pod::Usage qw(pod2usage);
+use Switch;
+use Data::Dump;
+
+our $vars_arg = "substitution";
+
+sub parse_arguments {
+    my %args = (
+        verbose       => 0,                    # be verbose (or not)
+        file          => "",                   # specify file
+        menu          => "fzf",                # "fzf" | "rofi"
+        "menu-args"   => "",                   # commandline arguments for menu
+        vars          => \&sanitize_arg_vars,  # "assignment" | "substitution"
+    );
+
+    Getopt::Long::Configure( "bundling" );
+    GetOptions( \%args
+              , 'help|h|?'
+              , 'man-help'
+              , 'verbose|v'
+              , 'file|f:s'
+              , 'menu|m=s'
+              , 'menu-args=s'
+              , 'vars|V=s' )
+    or pod2usage(2);
+    pod2usage(0) if $args{"help"};
+    pod2usage(-exitval => 0, -verbose => 2) if $args{"man-help"};
+
+    # positional argument for FILE => exit if non given
+    if ( $args{"file"} eq "" ) {
+        pod2usage( -message => "$0: No FILE given.", -exitval => 1)
+            if (@ARGV == 0);
+
+        $args{"file"} = $ARGV[0];
+    }
+
+    return %args;
+}
+
+sub sanitize_arg_vars {
+    my ( $opt_name, $opt_arg ) = @_;
+
+    switch ( "${opt_arg}" ) {
+        case "substitution" { $vars_arg = "substitution"; return }
+        case "assignment"   { $vars_arg = "assignment"; return }
+        else                { return }
+    }
+}
+
+sub md_file_open {
+    my $filename = shift;
+    open my $fh, '<', $filename or die "Cannot read file: $!";
+    return $fh;
+}
+
+sub md_file_close {
+    my $fh = shift;
+    close($fh);
+}
+
+sub parse_md_document {
+    my ( $_filename, $markdown_file, $markdown_document );
+    $_filename = shift;
+
+    $markdown_file = md_file_open( $_filename );
+    $markdown_document = CommonMark->parse(
+        file => $markdown_file,
+        normalize => 1,
+        smart => 1,
+        validate_utf8 => 1,
+    );
+    md_file_close( $markdown_file );
+
+    return $markdown_document;
+}
+
+sub build_tree {
+    # build a hash that contains block_quotes as keys and code_blocks as values for each
+    my ( $doc, %code_snippet, $iter );
+    $doc = shift;
+    $iter = $doc->iterator();
+
+    while ( my ( $ev_type, $node ) = $iter->next() ) {
+        if ( $node->get_type() == NODE_BLOCK_QUOTE
+                && $ev_type == EVENT_ENTER ) {
+            my $child = $node->first_child()->first_child();
+
+            next unless defined $node->next
+                && $node->next->get_type() == 5;
+            $code_snippet{$child->get_literal()} = $node->next->get_literal;
+        }
+    }
+
+    return %code_snippet;
+}
+
+sub prepare_list_for_choice {
+    # prepare perl list into elements delimited by newline for FZF
+    my ( @choice_list, $choice_string );
+    @choice_list = @_;
+
+    $choice_string = "";
+    for my $str ( @choice_list ) {
+        $choice_string .= sprintf( "%s\n", $str );
+    }
+
+    return $choice_string;
+}
+
+sub parse_variables_in_code {
+    my ( $code_string, @vars, @return_vars, %seen );
+    $code_string = shift;
+
+    # match variables in string using the regex
+    @vars = $code_string =~ m/(\$(\{|)(\w+)(\}|))/g;
+    for my $i ( 1 .. $#vars ) {
+        my $match = ${vars[$i-1]}
+            if $i % 4 == 3;
+        push @return_vars, $match
+            if defined $match;
+    }
+
+    # make them unique && return
+    # get rid of variables that:
+    # - start with '_',
+    # - start with/are numerical variables,
+    # - start with/are all UPPER-case
+    return grep( !/^_|^\d|^\p{IsUpper}/,
+        grep { ! $seen{ $_ }++ } @return_vars );
+}
+
+sub get_shell_variables_from_stdin {
+    my ( $vars_ref, $assigned_vars_ref ) = @_;
+
+    for my $var ( @$vars_ref ) {
+        my $tmp;
+        print( STDOUT "$var=" );
+        chomp( $tmp = <STDIN> );
+        print("\e[A\e[K");
+        ${$assigned_vars_ref}{$var} = $tmp;
+    }
+}
+
+sub rofi_input {
+    my $var = shift;
+    return `rofi -dmenu -p "${var}" -theme-str 'listview { enabled: false; } entry { placeholder: "Enter a variable."; }' -disable-history -no-plugins`;
+}
+
+sub get_shell_variables_from_rofi {
+    my ( $vars_ref, $assigned_vars_ref ) = @_;
+
+    for my $var ( @$vars_ref ) {
+        my $tmp;
+        chomp( $tmp = rofi_input($var) );
+        $assigned_vars_ref->{$var} = $tmp
+    }
+}
+
+sub assign_variables_in_snippet {
+    my ( $final_string, $code, $assigned_vars_ref );
+    ( $code, $assigned_vars_ref ) = @_;
+
+    while ( my ( $var, $value ) = each %$assigned_vars_ref ) {
+        $final_string .= ( $value =~ / / )
+            ? sprintf("%s=\"%s\"; ", $var, $value)
+            : sprintf("%s=%s; ", $var, $value);
+    }
+    $final_string .= ( %$assigned_vars_ref ) ? sprintf( "\n%s", $code ) : $code;
+
+    return $final_string;
+}
+
+sub substitute_variables_in_snippet {
+    my ( $final_string, $code, $assigned_vars_ref );
+    ( $code, $assigned_vars_ref ) = @_;
+
+    while ( my ( $var, $value ) = each %$assigned_vars_ref ) {
+        $code =~ s/(\$(\{|)(${var})(\}|))/${value}/g;
+    }
+
+    return $code;
+}
+
+sub main {
+    # open a file and parse it to MD tree
+    my ( %arguments, $markdown_document, %code_snippet, $choice_string,
+        $chosen, $chosen_code, @vars, %assigned_vars, $destined_string );
+
+    # parse arguments
+    %arguments = parse_arguments();
+
+    # open file to parse
+    $markdown_document = parse_md_document( $arguments{"file"} );
+
+    # build choice tree
+    %code_snippet = build_tree( $markdown_document );
+    $choice_string = prepare_list_for_choice( keys %code_snippet );
+
+    # allow user to choose
+    chomp( $chosen = `printf "%s" "$choice_string" | $arguments{"menu"} $arguments{"menu-args"}` || die "Interrupted" );
+    $chosen_code = $code_snippet{$chosen};
+
+    # search shell variables in the code snippet and make user supply values
+    @vars = parse_variables_in_code( $chosen_code );
+    if ( $arguments{"menu"} eq "rofi" ) {
+        get_shell_variables_from_rofi(\@vars, \%assigned_vars );
+    } else {
+        get_shell_variables_from_stdin( \@vars, \%assigned_vars );
+    }
+
+    # assign variables in shell / replace variables with values
+    if ( $vars_arg eq "assignment" ) {
+        $destined_string = assign_variables_in_snippet( $chosen_code, \%assigned_vars );
+    } elsif ( $vars_arg eq "substitution" ) {
+        $destined_string = substitute_variables_in_snippet( $chosen_code, \%assigned_vars );
+    }
+
+    Clipboard->copy_to_all_selections( "$destined_string" );
+    print( STDOUT "$destined_string" );
+
+    return 0;
+}
+
+main();
+
+__END__
